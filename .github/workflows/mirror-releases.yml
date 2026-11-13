@@ -41,7 +41,7 @@ on:
         options: [dry-run, notes-only, full]
         default: dry-run
       skip_existing:
-        description: 'full 模式下跳过已经有 Release 的 tag'
+        description: 'full 模式下跳过文件已齐全的 Release（缺文件的会继续补，可放心重复运行）'
         type: boolean
         default: true
       link_repo:
@@ -124,12 +124,23 @@ jobs:
             done < selected.txt
           fi
 
-          gh release list --limit 1000 --json tagName -q '.[].tagName' | sort > existing.txt
+          # 现有 Release 及其文件。“齐全”= 4 个 zip + amd64/arm64 两个 Docker tar 都在；
+          # 限流 / 中断后重新运行时，只有齐全的才跳过，缺文件的会继续补
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            -q '.[] | [.tag_name, ([.assets[].name] | join(" "))] | @tsv' > releases.tsv
+          cut -f1 releases.tsv | sort > existing.txt
+          awk -F'\t' '{
+            n = split($2, a, " "); delete h; for (i = 1; i <= n; i++) h[a[i]] = 1
+            amd = 0; arm = 0
+            for (k in h) { if (k ~ /^napcat-docker-.*-amd64\.tar$/) amd = 1; if (k ~ /^napcat-docker-.*-arm64\.tar$/) arm = 1 }
+            if (("NapCat.Shell.zip" in h) && ("NapCat.Framework.zip" in h) && ("NapCat.Shell.Windows.Node.zip" in h) \
+                && ("NapCat.Shell.Windows.OneKey.zip" in h) && amd && arm) print $1
+          }' releases.tsv | sort > complete.txt
           sort selected.txt > selected.sorted
           case "$MODE" in
             notes-only) comm -12 selected.sorted existing.txt | sort -V > tags.txt ;;
             full)
-              if [ "$SKIP_EXISTING" = true ]; then comm -23 selected.sorted existing.txt | sort -V > tags.txt
+              if [ "$SKIP_EXISTING" = true ]; then comm -23 selected.sorted complete.txt | sort -V > tags.txt
               else cp selected.txt tags.txt; fi ;;
             *) cp selected.txt tags.txt ;;
           esac
