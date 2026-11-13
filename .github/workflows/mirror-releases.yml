@@ -1,0 +1,495 @@
+# =============================================================================
+# 归档 fork：补齐历史版本的 Release（说明 + 产物 + Docker 镜像）
+# =============================================================================
+# 上游 NapNeko/NapCatQQ 的 tag / Release，以及 NapCat-Docker、NapCatResource 等
+# 配套仓库都已删除，本工作流在 fork 里按 tag 重建 Release：
+#
+#   说明    尽量还原上游原文，见 .github/mirror/notes.py
+#           （v4.18.38 起用原脚本重新生成＝逐字一致；更早的是发布时 AI 生成的，从存档找回）
+#   重新构建  NapCat.Shell.zip / NapCat.Framework.zip / NapCat.Shell.Windows.Node.zip
+#           用该 tag 自己的源码，按该 tag 自己 release workflow 里的配方
+#           （Node / pnpm 版本、QQ 安装包地址与校验值、拷贝的 QQ 文件列表）
+#   拉原包    NapCat.Shell.Windows.OneKey.zip（资源仓库已删，无法构建），以及构建失败的产物
+#           → 依次从 ASSET_MIRRORS 里同名 tag 的 Release 下载
+#   Docker   构建仓库已删，无法构建 → 从 Docker Hub 拉原镜像（amd64 / arm64），
+#           导出为 `docker load -i xxx.tar` 可直接导入的 tar，并附 .sha256
+#
+# 建议用法：
+#   1. mode=dry-run   先只生成说明，在运行汇总 / artifact 里检查
+#   2. mode=notes-only 把已存在的 Release 说明改回原文
+#   3. mode=full      补齐缺的 Release（可重复运行，已有的默认跳过）
+#
+# 可选 secrets：
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  登录 Docker Hub，避免匿名拉取限流（强烈建议）
+#   NEWRELEASES_API_KEY                   newreleases.io API key，找回说明更稳（没有就抓页面）
+# =============================================================================
+
+name: Mirror Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: '处理哪些版本：all，或空格/逗号分隔的 tag，如 v4.17.23 v4.18.42'
+        default: all
+      min_version:
+        description: 'tags=all 时的最低版本'
+        default: v4.15.0
+      mode:
+        description: 'dry-run=只生成说明供检查 / notes-only=只改已有 Release 的说明 / full=构建并发布'
+        type: choice
+        options: [dry-run, notes-only, full]
+        default: dry-run
+      skip_existing:
+        description: 'full 模式下跳过已经有 Release 的 tag'
+        type: boolean
+        default: true
+      link_repo:
+        description: '说明里提交/对比链接指向的仓库。NapNeko/NapCatQQ = 与原文一致；填你的 fork 则链接可点'
+        default: NapNeko/NapCatQQ
+      docker_fallback:
+        description: 'Docker Hub 没有该版本镜像时，改用最近的旧版本（文件名带 -fallback-）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-releases
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: NapNeko/NapCatQQ
+  DOCKER_IMAGE: mlikiowa/napcat-docker
+  # 拉原包时依次尝试的仓库：在这些仓库里找同名 tag 的 Release 资产
+  ASSET_MIRRORS: 5wthf/NapCatQQ xuyuan985-star/NapCatQQ wlz-remake/NapCatQQ
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 选 tag → 找回说明 → 按版本顺序创建 / 更新 Release（保证 Releases 页面顺序正确）
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      latest: ${{ steps.plan.outputs.latest }}
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20.x
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pandoc
+          python -m pip install -q beautifulsoup4
+
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_TAGS: ${{ inputs.tags }}
+          MIN_VERSION: ${{ inputs.min_version }}
+          MODE: ${{ inputs.mode }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+        run: |
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          all=$(git tag -l 'v*' | grep -E "$semver" | sort -V)
+          latest=$(tail -n1 <<<"$all")
+
+          if [ "$IN_TAGS" = all ]; then
+            : > selected.txt
+            while read -r t; do
+              if [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$t" | sort -V | head -n1)" = "$MIN_VERSION" ]; then
+                echo "$t" >> selected.txt
+              fi
+            done <<<"$all"
+          else
+            tr ',' ' ' <<<"$IN_TAGS" | tr -s ' \t' '\n' | sed '/^$/d' | sort -V | uniq > selected.txt
+            while read -r t; do
+              git rev-parse -q --verify "refs/tags/$t" >/dev/null || { echo "::error::tag $t 不存在"; exit 1; }
+            done < selected.txt
+          fi
+
+          gh release list --limit 1000 --json tagName -q '.[].tagName' | sort > existing.txt
+          sort selected.txt > selected.sorted
+          case "$MODE" in
+            notes-only) comm -12 selected.sorted existing.txt | sort -V > tags.txt ;;
+            full)
+              if [ "$SKIP_EXISTING" = true ]; then comm -23 selected.sorted existing.txt | sort -V > tags.txt
+              else cp selected.txt tags.txt; fi ;;
+            *) cp selected.txt tags.txt ;;
+          esac
+
+          count=$(grep -c . tags.txt || true)
+          if [ "$MODE" = full ] && [ "$count" -gt 256 ]; then
+            echo "::error::一次最多 256 个 tag（矩阵上限），当前 $count 个，请用 tags / min_version 分批"; exit 1
+          fi
+          {
+            echo "latest=$latest"
+            echo "count=$count"
+            echo "matrix=$(jq -R . tags.txt | jq -sc .)"
+          } >> "$GITHUB_OUTPUT"
+          echo "将处理 $count 个 tag（模式 $MODE），最新版本 $latest"
+          cat tags.txt
+
+      - name: Resolve original release notes
+        env:
+          LINK_REPO: ${{ inputs.link_repo }}
+          NEWRELEASES_API_KEY: ${{ secrets.NEWRELEASES_API_KEY }}
+        run: |
+          mkdir -p notes
+          {
+            echo "### Release 说明来源"
+            echo
+            echo "| 版本 | 来源 |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r t; do
+            [ -n "$t" ] || continue
+            src=$(python .github/mirror/notes.py --tag "$t" --repo-dir . --out "notes/$t.md" --link-repo "$LINK_REPO")
+            printf '%s\t%s\n' "$t" "$src" >> notes/sources.tsv
+            echo "| $t | $src |" >> "$GITHUB_STEP_SUMMARY"
+            case "$src" in newreleases|wayback) sleep 2 ;; esac
+          done < tags.txt
+          {
+            echo
+            echo "generator = 用原脚本重新生成（逐字一致）；newreleases / wayback = 从存档找回；"
+            echo "override = 手工文件 release-notes/<tag>.md；**fallback = 没找回，按提交记录生成**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload notes
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-notes
+          path: notes/
+          if-no-files-found: ignore
+
+      - name: Create / update releases in version order
+        if: inputs.mode != 'dry-run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          LATEST: ${{ steps.plan.outputs.latest }}
+        run: |
+          while read -r t; do
+            [ -n "$t" ] || continue
+            if grep -qx "$t" existing.txt; then
+              echo "更新说明 $t"
+              gh release edit "$t" --title "NapCat $t" --notes-file "notes/$t.md"
+            elif [ "$MODE" = full ]; then
+              echo "创建 $t"
+              flag=--latest=false
+              [ "$t" = "$LATEST" ] && flag=--latest
+              gh release create "$t" --verify-tag --title "NapCat $t" --notes-file "notes/$t.md" "$flag"
+            fi
+            sleep 2   # 避开创建类 API 的速率限制
+          done < tags.txt
+
+  # ---------------------------------------------------------------------------
+  # 每个 tag：重新构建 / 拉原包 / 拉 Docker 原镜像 → 上传
+  # ---------------------------------------------------------------------------
+  release:
+    needs: prepare
+    if: inputs.mode == 'full' && needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        tag: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      TAG: ${{ matrix.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      REPORT: ${{ github.workspace }}/../report.tsv
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+
+      - name: Checkout ${{ matrix.tag }}
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ matrix.tag }}
+          persist-credentials: false
+
+      - name: Download notes
+        uses: actions/download-artifact@v7
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes
+
+      # 从该 tag 自己的 release workflow 里读出当时的构建配方
+      - name: Detect original recipe
+        id: tc
+        run: |
+          : > "$REPORT"
+          wf=.github/workflows/release-publish.yml
+          [ -f "$wf" ] || wf=.github/workflows/release.yml
+          if [ ! -f "$wf" ]; then echo "::warning::$TAG 没有 release workflow，用默认配方"; wf=/dev/null; fi
+
+          node=$(grep -oE "node-version: *['\"]?[0-9][0-9.x]*" "$wf" | head -n1 | grep -oE '[0-9][0-9.x]*$' || true)
+          if grep -q 'npm i -g pnpm' "$wf"; then
+            pnpm=10   # 当时装的是最新版 pnpm（10.x）
+          else
+            pnpm=$(grep -A4 'pnpm/action-setup' "$wf" | grep -oE 'version: *[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)
+          fi
+          qq_url=$(grep -oE 'https://[^"'"'"' ]+\.exe' "$wf" | head -n1 || true)
+          qq_sha=$(grep -oE 'QQ_SHA256: *[0-9a-f]{64}' "$wf" | head -n1 | grep -oE '[0-9a-f]{64}' || true)
+          node_win=$(grep -oE "NODE_VER(SION)?[:=] *['\"]?[0-9]+\.[0-9]+\.[0-9]+" "$wf" | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          targets=$(grep -oE 'QQ_TARGETS=\(.*\)' "$wf" | head -n1 | grep -oE '"[^"]+"' | tr -d '"' | tr '\n' ' ' || true)
+          first_match=0; grep -q -- '-print -quit' "$wf" && first_match=1
+          win64=0;       grep -q 'win64/' "$wf" && win64=1
+          deldev=0;      grep -q 'npm pkg delete devDependencies' "$wf" && deldev=1
+
+          {
+            echo "node=${node:-20.x}"
+            echo "pnpm=${pnpm:-9}"
+            echo "qq_url=$qq_url"
+            echo "qq_sha=$qq_sha"
+            echo "node_win=${node_win:-22.11.0}"
+            echo "targets=${targets:-avif_convert.dll broadcast_ipc.dll config.json libglib-2.0-0.dll libgobject-2.0-0.dll libvips-42.dll ncnn.dll opencv.dll package.json QBar.dll wrapper.node LightQuic.dll}"
+            echo "first_match=$first_match"
+            echo "win64=$win64"
+            echo "deldev=$deldev"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ steps.tc.outputs.node }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ steps.tc.outputs.pnpm }}
+          run_install: false
+
+      - name: Install dependencies & build WebUI
+        id: deps
+        continue-on-error: true
+        env:
+          NAPCAT_VERSION: ${{ matrix.tag }}
+          GITHUB_TOKEN: ''
+        run: |
+          pnpm i
+          pnpm --filter napcat-webui-frontend run build
+
+      - name: Rebuild NapCat.Shell
+        id: shell
+        if: steps.deps.outcome == 'success'
+        continue-on-error: true
+        env:
+          NAPCAT_VERSION: ${{ matrix.tag }}
+          GITHUB_TOKEN: ''
+          DELDEV: ${{ steps.tc.outputs.deldev }}
+        run: |
+          pnpm run build:shell
+          pnpm --filter napcat-plugin-builtin run build   # 会拷进 napcat-shell/dist/plugins
+          mkdir -p out
+          mv packages/napcat-shell/dist out/NapCat.Shell
+          cd out/NapCat.Shell
+          if [ "$DELDEV" = 1 ]; then npm pkg delete devDependencies; fi
+          if ! npm install --omit=dev; then
+            # 老版本今天会报 "Cannot read properties of null (reading 'edgesOut')"，
+            # 上游在 v4.18.41 的修复就是先删 devDependencies，这里同样处理后重试
+            echo "::warning::npm install --omit=dev 失败，删除 devDependencies 后重试（同上游 v4.18.41 的修复）"
+            npm pkg delete devDependencies
+            rm -rf node_modules package-lock.json
+            npm install --omit=dev
+          fi
+          rm -f package-lock.json
+
+      - name: Rebuild NapCat.Framework
+        id: framework
+        if: steps.deps.outcome == 'success'
+        continue-on-error: true
+        env:
+          NAPCAT_VERSION: ${{ matrix.tag }}
+          GITHUB_TOKEN: ''
+          DELDEV: ${{ steps.tc.outputs.deldev }}
+        run: |
+          pnpm run build:framework
+          mkdir -p out
+          mv packages/napcat-framework/dist out/NapCat.Framework
+          cd out/NapCat.Framework
+          if [ "$DELDEV" = 1 ]; then npm pkg delete devDependencies; fi
+          if ! npm install --omit=dev; then
+            # 老版本今天会报 "Cannot read properties of null (reading 'edgesOut')"，
+            # 上游在 v4.18.41 的修复就是先删 devDependencies，这里同样处理后重试
+            echo "::warning::npm install --omit=dev 失败，删除 devDependencies 后重试（同上游 v4.18.41 的修复）"
+            npm pkg delete devDependencies
+            rm -rf node_modules package-lock.json
+            npm install --omit=dev
+          fi
+          rm -f package-lock.json
+
+      - name: Rebuild NapCat.Shell.Windows.Node
+        id: winnode
+        if: steps.shell.outcome == 'success' && steps.tc.outputs.qq_url != ''
+        continue-on-error: true
+        env:
+          QQ_URL: ${{ steps.tc.outputs.qq_url }}
+          QQ_SHA256: ${{ steps.tc.outputs.qq_sha }}
+          NODE_WIN: ${{ steps.tc.outputs.node_win }}
+          QQ_TARGETS: ${{ steps.tc.outputs.targets }}
+          FIRST_MATCH: ${{ steps.tc.outputs.first_match }}
+          WIN64: ${{ steps.tc.outputs.win64 }}
+        run: |
+          command -v 7z >/dev/null || { sudo apt-get update -qq; sudo apt-get install -y -qq p7zip-full; }
+          dl="$RUNNER_TEMP/dl"; qq="$RUNNER_TEMP/qq"; nd="$RUNNER_TEMP/node-win"
+          mkdir -p "$dl" "$qq" "$nd"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 1200 \
+            -A 'Mozilla/5.0' -o "$dl/qq.exe" "$QQ_URL"
+          if [ -n "$QQ_SHA256" ]; then echo "$QQ_SHA256  $dl/qq.exe" | sha256sum --check --strict -; fi
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o "$dl/node.zip" \
+            "https://nodejs.org/dist/v$NODE_WIN/node-v$NODE_WIN-win-x64.zip"
+          7z x -y -o"$qq" "$dl/qq.exe" >/dev/null
+          unzip -q "$dl/node.zip" -d "$nd"
+
+          out=out/NapCat.Shell.Windows.Node
+          mkdir -p "$out"
+          cp -a out/NapCat.Shell/. "$out/napcat/"
+          for name in $QQ_TARGETS; do
+            if [ "$FIRST_MATCH" = 1 ]; then
+              f=$(find "$qq" -type f -iname "$name" -print -quit)
+              if [ -z "$f" ]; then echo "::error::QQ 安装包里缺少 $name"; exit 1; fi
+              cp -a "$f" "$out/"
+            else
+              find "$qq" -iname "$name" -exec cp -a {} "$out" \; || true
+            fi
+          done
+          if [ ! -f "$out/wrapper.node" ]; then echo "::error::缺少 wrapper.node"; exit 1; fi
+          if [ "$WIN64" = 1 ]; then
+            mkdir -p "$out/win64"
+            for n in SSOShareInfoHelper64.dll parent-ipc-core-x64.dll; do
+              find "$qq" -ipath "*/win64/$n" -exec cp -a {} "$out/win64/" \; || true
+            done
+          fi
+          for f in napcat.bat index.js QQNT.dll; do cp -a "packages/napcat-develop/$f" "$out/" || true; done
+          cp -a "$nd/node-v$NODE_WIN-win-x64/node.exe" "$out/"
+          rm -rf "$dl" "$qq" "$nd"
+
+      - name: Package rebuilt zips
+        run: |
+          mkdir -p dist
+          for n in NapCat.Shell NapCat.Framework NapCat.Shell.Windows.Node; do
+            if [ -d "out/$n" ]; then
+              (cd "out/$n" && zip -qr "$GITHUB_WORKSPACE/dist/$n.zip" .)
+              printf '%s\t%s\n' "$n.zip" "重新构建" >> "$REPORT"
+            fi
+          done
+          rm -rf out node_modules packages/*/node_modules
+
+      - name: Pull original packages (OneKey + failed rebuilds)
+        run: |
+          own=$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)
+          for n in NapCat.Shell.zip NapCat.Framework.zip NapCat.Shell.Windows.Node.zip NapCat.Shell.Windows.OneKey.zip; do
+            if [ -f "dist/$n" ]; then continue; fi
+            if grep -qx "$n" <<<"$own"; then printf '%s\t%s\n' "$n" "保留 Release 里已有的文件" >> "$REPORT"; continue; fi
+            got=
+            for m in $ASSET_MIRRORS; do
+              if gh release download "$TAG" -R "$m" -p "$n" -D dist --clobber 2>/dev/null; then got=$m; break; fi
+            done
+            if [ -n "$got" ]; then printf '%s\t%s\n' "$n" "原包（$got）" >> "$REPORT"; continue; fi
+
+            if [ "$n" = NapCat.Shell.Windows.OneKey.zip ]; then
+              # 原流程每次都从 NapCatResource 主分支取同一个文件，相邻版本通用 → 取本仓库最近版本里的
+              cands=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                -q '.[] | select([.assets[].name] | index("NapCat.Shell.Windows.OneKey.zip")) | .tag_name' \
+                | grep -E '^v[0-9]' | sort -V || true)
+              near=$(printf '%s\n%s\n' "$cands" "$TAG" | sed '/^$/d' | sort -V | uniq | awk -v t="$TAG" '$0==t{print p; exit} {p=$0}' || true)
+              [ -n "$near" ] || near=$(printf '%s\n%s\n' "$cands" "$TAG" | sed '/^$/d' | sort -V | uniq | awk -v t="$TAG" 'f{print; exit} $0==t{f=1}' || true)
+              if [ -n "$near" ] && gh release download "$near" -p "$n" -D dist --clobber; then
+                printf '%s\t%s\n' "$n" "原包（取自本仓库 $near，同一资源文件）" >> "$REPORT"; continue
+              fi
+            fi
+            printf '%s\t%s\n' "$n" "缺失" >> "$REPORT"
+          done
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Pull original Docker images
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          FALLBACK: ${{ inputs.docker_fallback }}
+        run: |
+          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
+            crane auth login index.docker.io -u "$DH_USER" -p "$DH_TOKEN"
+          fi
+          tags=""; listed=
+          for i in 1 2 3; do
+            if tags=$(crane ls "$DOCKER_IMAGE"); then listed=1; break; fi
+            sleep 20
+          done
+          if [ -z "$listed" ]; then
+            printf '%s\t%s\n' "napcat-docker" "Docker Hub 访问失败" >> "$REPORT"; exit 0
+          fi
+          use=""; label=""
+          if grep -qx "$TAG" <<<"$tags"; then
+            use=$TAG; label=$TAG
+          elif [ "$FALLBACK" = true ]; then
+            use=$( { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" || true; echo "$TAG"; } \
+              | sort -V | uniq | awk -v t="$TAG" '$0==t{print p; exit} {p=$0}' || true)
+            if [ -n "$use" ]; then label="$TAG-fallback-$use"; fi
+          fi
+          if [ -z "$use" ]; then
+            printf '%s\t%s\n' "napcat-docker" "Docker Hub 上没有该版本镜像" >> "$REPORT"; exit 0
+          fi
+          for arch in amd64 arm64; do
+            f="napcat-docker-$label-$arch.tar"
+            ok=
+            for i in 1 2 3; do
+              if crane pull --platform "linux/$arch" "$DOCKER_IMAGE:$use" "dist/$f"; then ok=1; break; fi
+              rm -f "dist/$f"; sleep $((30 * i))
+            done
+            if [ -n "$ok" ]; then
+              (cd dist && sha256sum "$f" > "$f.sha256")
+              printf '%s\t%s\n' "$f" "原镜像 $DOCKER_IMAGE:$use" >> "$REPORT"
+            else
+              printf '%s\t%s\n' "$f" "拉取失败" >> "$REPORT"
+            fi
+          done
+
+      - name: Upload to release
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "NapCat $TAG" \
+              --notes-file "$RUNNER_TEMP/notes/$TAG.md" --latest=false
+          fi
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then echo "::warning::没有可上传的文件"; exit 0; fi
+          ls -la dist
+          for f in "${files[@]}"; do
+            for _ in 1 2 3; do gh release upload "$TAG" "$f" --clobber && break; sleep 20; done
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### $TAG"
+            echo
+            echo "| 文件 | 来源 |"
+            echo "| --- | --- |"
+            [ -f "$REPORT" ] && awk -F'\t' '{printf "| %s | %s |\n", $1, $2}' "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$REPORT" ] && grep -qE '缺失|失败' "$REPORT"; then
+            echo "::error::$TAG 有产物没拿到，见汇总；可直接 Re-run failed jobs"
+            exit 1
+          fi
