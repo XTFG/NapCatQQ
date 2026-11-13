@@ -45,8 +45,8 @@ on:
         type: boolean
         default: true
       link_repo:
-        description: '说明里提交/对比链接指向的仓库。NapNeko/NapCatQQ = 与原文一致；填你的 fork 则链接可点'
-        default: NapNeko/NapCatQQ
+        description: '说明里提交/对比链接指向的仓库。留空 = 本仓库（链接可点）；填 NapNeko/NapCatQQ = 与原文逐字一致（链接已失效）'
+        default: ''
       docker_fallback:
         description: 'Docker Hub 没有该版本镜像时，改用最近的旧版本（文件名带 -fallback-）'
         type: boolean
@@ -159,7 +159,7 @@ jobs:
 
       - name: Resolve original release notes
         env:
-          LINK_REPO: ${{ inputs.link_repo }}
+          LINK_REPO: ${{ inputs.link_repo || github.repository }}
           NEWRELEASES_API_KEY: ${{ secrets.NEWRELEASES_API_KEY }}
         run: |
           mkdir -p notes
