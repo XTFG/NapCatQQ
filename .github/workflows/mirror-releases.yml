@@ -58,6 +58,8 @@ concurrency:
 
 env:
   UPSTREAM: NapNeko/NapCatQQ
+  # 说明里的文档链接 https://napneko.github.io/... 换成自己的文档站（路径不变）；留空则保持原链接
+  DOCS_URL: https://xtfg.github.io/NapCatDocs/
   # 镜像名保持原样，docker load 后与原来的 compose 配置通用
   DOCKER_IMAGE: mlikiowa/napcat-docker
   # 保留了 NapNeko/NapCat-Docker 完整历史的 fork，依次尝试
@@ -76,8 +78,8 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      count: ${{ steps.plan.outputs.count }}
+      matrix: ${{ steps.notes.outputs.matrix }}
+      count: ${{ steps.notes.outputs.count }}
       latest: ${{ steps.plan.outputs.latest }}
     env:
       GH_REPO: ${{ github.repository }}
@@ -149,24 +151,19 @@ jobs:
             *) cp selected.txt tags.txt ;;
           esac
 
-          count=$(grep -c . tags.txt || true)
-          if [ "$MODE" = full ] && [ "$count" -gt 256 ]; then
-            echo "::error::一次最多 256 个 tag（矩阵上限），当前 $count 个，请用 tags / min_version 分批"; exit 1
-          fi
-          {
-            echo "latest=$latest"
-            echo "count=$count"
-            echo "matrix=$(jq -R . tags.txt | jq -sc .)"
-          } >> "$GITHUB_OUTPUT"
-          echo "将处理 $count 个 tag（模式 $MODE），最新版本 $latest"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "候选 $(grep -c . tags.txt || true) 个 tag（模式 $MODE），最新版本 $latest"
           cat tags.txt
 
       - name: Resolve original release notes
+        id: notes
         env:
+          MODE: ${{ inputs.mode }}
           LINK_REPO: ${{ inputs.link_repo || github.repository }}
           NEWRELEASES_API_KEY: ${{ secrets.NEWRELEASES_API_KEY }}
         run: |
           mkdir -p notes
+          : > notes/sources.tsv
           {
             echo "### Release 说明来源"
             echo
@@ -175,7 +172,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           while read -r t; do
             [ -n "$t" ] || continue
-            src=$(python .github/mirror/notes.py --tag "$t" --repo-dir . --out "notes/$t.md" --link-repo "$LINK_REPO")
+            src=$(python .github/mirror/notes.py --tag "$t" --repo-dir . --out "notes/$t.md" --link-repo "$LINK_REPO" --docs-url "$DOCS_URL")
             printf '%s\t%s\n' "$t" "$src" >> notes/sources.tsv
             echo "| $t | $src |" >> "$GITHUB_STEP_SUMMARY"
             case "$src" in newreleases|wayback) sleep 2 ;; esac
@@ -183,8 +180,37 @@ jobs:
           {
             echo
             echo "generator = 用原脚本重新生成（逐字一致）；newreleases / wayback = 从存档找回；"
-            echo "override = 手工文件 release-notes/<tag>.md；**fallback = 没找回，按提交记录生成**"
+            echo "override = 手工文件 release-notes/<tag>.md；**fallback = 没找回（有来源出错，没法下结论），按提交记录生成，照常发布**；"
+            echo "**unreleased = newreleases 和 Wayback 都明确没有记录 → 上游没正式发布过，不建 Release、不构建**"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # 去掉上游没正式发布过的版本（想强制发布：放一份 release-notes/<tag>.md）
+          awk -F'\t' 'FILENAME == ARGV[1] { if ($2 == "unreleased") skip[$1] = 1; next } $0 != "" && !($0 in skip)' \
+            notes/sources.tsv tags.txt > tags.final
+          unreleased=$(awk -F'\t' '$2 == "unreleased" { print $1 }' notes/sources.tsv)
+          if [ -n "$unreleased" ]; then
+            {
+              echo
+              echo "#### 上游未正式发布、已跳过的版本"
+              echo
+              for t in $unreleased; do echo "- $t"; done
+            } >> "$GITHUB_STEP_SUMMARY"
+            for t in $unreleased; do
+              if grep -qx "$t" existing.txt; then
+                echo "::warning::$t 上游没正式发布过，但本仓库已有它的 Release（工作流不会删），需要的话请手动删除"
+              fi
+            done
+          fi
+
+          count=$(grep -c . tags.final || true)
+          if [ "$MODE" = full ] && [ "$count" -gt 256 ]; then
+            echo "::error::一次最多构建 256 个版本（矩阵上限），当前 $count 个，请用 tags / min_version 分批"; exit 1
+          fi
+          {
+            echo "count=$count"
+            echo "matrix=$(jq -R . tags.final | jq -sc .)"
+          } >> "$GITHUB_OUTPUT"
+          echo "最终处理 $count 个版本，跳过未发布的 $(grep -c . <<<"$unreleased" || true) 个"
 
       - name: Upload notes
         if: always()
@@ -213,10 +239,10 @@ jobs:
               gh release create "$t" --verify-tag --title "NapCat $t" --notes-file "notes/$t.md" "$flag"
             fi
             sleep 2   # 避开创建类 API 的速率限制
-          done < tags.txt
+          done < tags.final
 
   # ---------------------------------------------------------------------------
-  # 每个 tag：重新构建 / 拉原包 / 拉 Docker 原镜像 → 上传
+  # 每个 tag：重新构建 / 拉原包 / 构建 Docker 镜像 → 上传
   # ---------------------------------------------------------------------------
   release:
     needs: prepare
