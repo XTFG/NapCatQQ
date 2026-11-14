@@ -11,10 +11,13 @@
 #           （Node / pnpm 版本、QQ 安装包地址与校验值、拷贝的 QQ 文件列表）
 #   拉原包    NapCat.Shell.Windows.OneKey.zip（资源仓库已删，无法构建），以及构建失败的产物
 #           → 依次从 ASSET_MIRRORS 里同名 tag 的 Release 下载
-#   Docker   Docker Hub 上的原镜像已删 → 重新构建（amd64 / arm64）：
+#   Docker   Docker Hub 上的原镜像已删 → 重新构建，amd64 / arm64 各在原生机器上构建（不用 QEMU 模拟）：
 #           用 NapCat-Docker 的 fork（完整保留了历史），取该版本发布时的那一版
-#           Dockerfile / base / entrypoint（含当时锁定的 LinuxQQ），放入本次的 NapCat.Shell.zip，
-#           导出为 `docker load -i xxx.tar` 可直接导入的 tar（镜像名仍是 mlikiowa/napcat-docker:<tag>），附 .sha256
+#           Dockerfile / base / entrypoint（含当时锁定的 LinuxQQ），放入该版本的 NapCat.Shell.zip。
+#           ① 导出 `docker load -i xxx.tar` 可直接导入的 tar（镜像名仍是 mlikiowa/napcat-docker:<tag>），附 .sha256
+#           ② 推送到 GHCR：ghcr.io/<你的用户名>/napcat-docker:<tag>（多架构，最新版另打 latest）
+#
+# 流程：prepare（说明、建 Release）→ release（每版本打包 zip）→ docker（每版本×架构）→ ghcr（合并多架构标签）
 #
 # 建议用法：
 #   1. mode=dry-run   先只生成说明，在运行汇总 / artifact 里检查
@@ -51,6 +54,7 @@ on:
 
 permissions:
   contents: write
+  packages: write   # 推送 GHCR
 
 concurrency:
   group: mirror-releases
@@ -60,8 +64,10 @@ env:
   UPSTREAM: NapNeko/NapCatQQ
   # 说明里的文档链接 https://napneko.github.io/... 换成自己的文档站（路径不变）；留空则保持原链接
   DOCS_URL: https://xtfg.github.io/NapCatDocs/
-  # 镜像名保持原样，docker load 后与原来的 compose 配置通用
+  # tar 里的镜像名保持原样，docker load 后与原来的 compose 配置通用
   DOCKER_IMAGE: mlikiowa/napcat-docker
+  # GHCR 上的包名：ghcr.io/<仓库所有者>/<这个名字>
+  GHCR_NAME: napcat-docker
   # 保留了 NapNeko/NapCat-Docker 完整历史的 fork，依次尝试
   DOCKER_SRC_REPOS: XTFG/NapCat-Docker BB0813/NapCat-Docker synodriver/NapCat-Docker
   # 拉原包时依次尝试的仓库：在这些仓库里找同名 tag 的 Release 资产
@@ -78,9 +84,13 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.notes.outputs.matrix }}
-      count: ${{ steps.notes.outputs.count }}
+      release_matrix: ${{ steps.notes.outputs.release_matrix }}
+      release_count: ${{ steps.notes.outputs.release_count }}
+      docker_matrix: ${{ steps.notes.outputs.docker_matrix }}
+      docker_count: ${{ steps.notes.outputs.docker_count }}
+      tag_dates: ${{ steps.notes.outputs.tag_dates }}
       latest: ${{ steps.plan.outputs.latest }}
+      ghcr_image: ${{ steps.plan.outputs.ghcr_image }}
     env:
       GH_REPO: ${{ github.repository }}
     steps:
@@ -102,6 +112,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq pandoc
           python -m pip install -q beautifulsoup4
+
+      - name: Log in to GHCR
+        if: inputs.mode == 'full'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Plan
         id: plan
@@ -130,19 +148,33 @@ jobs:
             done < selected.txt
           fi
 
-          # 现有 Release 及其文件。“齐全”= 4 个 zip + 本版本的 amd64/arm64 Docker tar 都在
-          # （-fallback- 的替代镜像不算，会重新构建）；
-          # 限流 / 中断后重新运行时，只有齐全的才跳过，缺文件的会继续补
+          ghcr_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$GHCR_NAME"
+          echo "ghcr_image=$ghcr_image" >> "$GITHUB_OUTPUT"
+
+          # 现有 Release 及其文件，zip 和 Docker 分开判断是否齐全，重新运行时只补缺的部分：
+          #   zip 齐全    = 4 个 zip 都在
+          #   Docker 齐全 = 本版本的 amd64/arm64 tar 都在（-fallback- 的替代镜像不算）且 GHCR 上已有该标签
           gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
             -q '.[] | [.tag_name, ([.assets[].name] | join(" "))] | @tsv' > releases.tsv
           cut -f1 releases.tsv | sort > existing.txt
           awk -F'\t' '{
             n = split($2, a, " "); delete h; for (i = 1; i <= n; i++) h[a[i]] = 1
             if (("NapCat.Shell.zip" in h) && ("NapCat.Framework.zip" in h) && ("NapCat.Shell.Windows.Node.zip" in h) \
-                && ("NapCat.Shell.Windows.OneKey.zip" in h) \
-                && (("napcat-docker-" $1 "-amd64.tar") in h) && (("napcat-docker-" $1 "-arm64.tar") in h)) print $1
-          }' releases.tsv | sort > complete.txt
+                && ("NapCat.Shell.Windows.OneKey.zip" in h)) print $1
+          }' releases.tsv | sort > zips_complete.txt
+          awk -F'\t' '{
+            n = split($2, a, " "); delete h; for (i = 1; i <= n; i++) h[a[i]] = 1
+            if ((("napcat-docker-" $1 "-amd64.tar") in h) && (("napcat-docker-" $1 "-arm64.tar") in h)) print $1
+          }' releases.tsv | sort > tars_complete.txt
           sort selected.txt > selected.sorted
+          : > docker_complete.txt
+          if [ "$MODE" = full ]; then
+            while read -r t; do
+              if docker buildx imagetools inspect "$ghcr_image:$t" >/dev/null 2>&1; then echo "$t" >> docker_complete.txt; fi
+            done < <(comm -12 selected.sorted tars_complete.txt)
+          fi
+          sort -o docker_complete.txt docker_complete.txt
+          comm -12 zips_complete.txt docker_complete.txt > complete.txt
           case "$MODE" in
             notes-only) comm -12 selected.sorted existing.txt | sort -V > tags.txt ;;
             full)
@@ -159,6 +191,7 @@ jobs:
         id: notes
         env:
           MODE: ${{ inputs.mode }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
           LINK_REPO: ${{ inputs.link_repo || github.repository }}
           NEWRELEASES_API_KEY: ${{ secrets.NEWRELEASES_API_KEY }}
           NOTES_DEBUG_DIR: notes/debug   # 提取失败时保存原页面，随说明包一起上传
@@ -203,15 +236,34 @@ jobs:
             done
           fi
 
-          count=$(grep -c . tags.final || true)
-          if [ "$MODE" = full ] && [ "$count" -gt 256 ]; then
-            echo "::error::一次最多构建 256 个版本（矩阵上限），当前 $count 个，请用 tags / min_version 分批"; exit 1
+          # 两个阶段各自要处理的版本：zip 阶段跳过 zip 已齐全的，Docker 阶段跳过镜像已齐全的
+          if [ "$MODE" = full ] && [ "$SKIP_EXISTING" = true ]; then
+            comm -23 <(sort tags.final) zips_complete.txt | sort -V > release.list
+            comm -23 <(sort tags.final) docker_complete.txt | sort -V > docker.list
+          else
+            cp tags.final release.list
+            cp tags.final docker.list
           fi
+          release_count=$(grep -c . release.list || true)
+          docker_count=$(grep -c . docker.list || true)
+          if [ "$MODE" = full ] && { [ "$release_count" -gt 256 ] || [ "$docker_count" -gt 128 ]; }; then
+            echo "::error::矩阵上限 256 个任务（Docker 每个版本占 2 个），当前 zip $release_count 个、Docker $docker_count 个版本，请用 tags / min_version 分批"; exit 1
+          fi
+          # Docker 阶段按发布时间（打 tag 的时间）找当时的配方
+          while read -r t; do
+            [ -n "$t" ] || continue
+            ts=$(git for-each-ref --format='%(taggerdate:unix)' "refs/tags/$t")
+            [ -n "$ts" ] || ts=$(git log -1 --format=%ct "$t^{commit}")
+            printf '%s\t%s\n' "$t" "$ts"
+          done < docker.list > tag_dates.tsv
           {
-            echo "count=$count"
-            echo "matrix=$(jq -R . tags.final | jq -sc .)"
+            echo "release_count=$release_count"
+            echo "release_matrix=$(jq -R . release.list | jq -sc .)"
+            echo "docker_count=$docker_count"
+            echo "docker_matrix=$(jq -R . docker.list | jq -sc .)"
+            echo "tag_dates=$(jq -Rn '[inputs | split("\t") | {(.[0]): (.[1] | tonumber)}] | add // {}' -c < tag_dates.tsv)"
           } >> "$GITHUB_OUTPUT"
-          echo "最终处理 $count 个版本，跳过未发布的 $(grep -c . <<<"$unreleased" || true) 个"
+          echo "共 $(grep -c . tags.final || true) 个版本：打包 zip $release_count 个，构建 Docker $docker_count 个；跳过未发布的 $(grep -c . <<<"$unreleased" || true) 个"
 
       - name: Upload notes
         if: always()
@@ -243,18 +295,18 @@ jobs:
           done < tags.final
 
   # ---------------------------------------------------------------------------
-  # 每个 tag：重新构建 / 拉原包 / 构建 Docker 镜像 → 上传
+  # 每个版本：重新构建 zip / 拉原包 → 上传
   # ---------------------------------------------------------------------------
   release:
     needs: prepare
-    if: inputs.mode == 'full' && needs.prepare.outputs.count != '0'
+    if: inputs.mode == 'full' && needs.prepare.outputs.release_count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 8
       matrix:
-        tag: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+        tag: ${{ fromJSON(needs.prepare.outputs.release_matrix) }}
     env:
       TAG: ${{ matrix.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -465,16 +517,69 @@ jobs:
             printf '%s\t%s\n' "$n" "缺失" >> "$REPORT"
           done
 
-      # ---- Docker：用当时的 NapCat-Docker 配方重新构建 ----
-      - name: Prepare Docker build context
-        id: dk
-        continue-on-error: true
+      - name: Upload to release
         run: |
-          # 构建要用的 NapCat.Shell.zip：本次构建/拉取的，或 Release 里已有的
-          shell_zip=dist/NapCat.Shell.zip
-          if [ ! -f "$shell_zip" ]; then
-            shell_zip="$RUNNER_TEMP/NapCat.Shell.zip"
-            gh release download "$TAG" -p NapCat.Shell.zip -O "$shell_zip" --clobber
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "NapCat $TAG" \
+              --notes-file "$RUNNER_TEMP/notes/$TAG.md" --latest=false
+          fi
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then echo "::warning::没有可上传的文件"; exit 0; fi
+          ls -la dist
+          for f in "${files[@]}"; do
+            for _ in 1 2 3; do gh release upload "$TAG" "$f" --clobber && break; sleep 20; done
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### $TAG"
+            echo
+            echo "| 文件 | 来源 |"
+            echo "| --- | --- |"
+            [ -f "$REPORT" ] && awk -F'\t' '{printf "| %s | %s |\n", $1, $2}' "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$REPORT" ] && grep -qE '缺失|失败' "$REPORT"; then
+            echo "::error::$TAG 有产物没拿到，见汇总；可直接 Re-run failed jobs"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Docker：每个版本 × 架构一个任务，在对应架构的原生机器上构建
+  #   → 导出 tar 上传到 Release，同时按 digest 推送到 GHCR（最后由 ghcr 任务合并成多架构标签）
+  # ---------------------------------------------------------------------------
+  docker:
+    needs: [prepare, release]
+    # zip 阶段有版本失败也照常运行；缺 NapCat.Shell.zip 的版本会在这里单独报错
+    if: ${{ !cancelled() && inputs.mode == 'full' && needs.prepare.outputs.docker_count != '0' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        tag: ${{ fromJSON(needs.prepare.outputs.docker_matrix) }}
+        arch: [amd64, arm64]
+    env:
+      TAG: ${{ matrix.tag }}
+      ARCH: ${{ matrix.arch }}
+      TAG_TS: ${{ fromJSON(needs.prepare.outputs.tag_dates)[matrix.tag] }}
+      GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+
+      - name: Prepare build context
+        id: dk
+        run: |
+          # 该版本的 NapCat.Shell.zip（zip 阶段已上传到 Release）
+          shell_zip="$RUNNER_TEMP/NapCat.Shell.zip"
+          if ! gh release download "$TAG" -p NapCat.Shell.zip -O "$shell_zip" --clobber; then
+            echo "::error::$TAG 的 Release 里没有 NapCat.Shell.zip（zip 阶段失败？先重跑它）"; exit 1
           fi
           unzip -tq "$shell_zip"
 
@@ -485,15 +590,14 @@ jobs:
           done
           [ -n "${repo:-}" ] || { echo "::error::NapCat-Docker 的 fork 都拉不到"; exit 1; }
 
-          # 发布时间 = 打 tag 的时间（没有就用提交时间）；取那之后 1 小时内 NapCat-Docker 的最新提交
-          ts=$(git for-each-ref --format='%(taggerdate:unix)' "refs/tags/$TAG")
-          [ -n "$ts" ] || ts=$(git log -1 --format=%ct "$TAG^{commit}")
-          commit=$(git -C "$src" rev-list -1 --before="@$((ts + 3600))" HEAD)
+          # 发布时间 = 打 tag 的时间；取那之后 1 小时内 NapCat-Docker 的最新提交
+          [ -n "$TAG_TS" ] || { echo "::error::没拿到 $TAG 的发布时间"; exit 1; }
+          commit=$(git -C "$src" rev-list -1 --before="@$((TAG_TS + 3600))" HEAD)
           [ -n "$commit" ] || commit=$(git -C "$src" rev-list --max-parents=0 HEAD | tail -n1)
           git -C "$src" checkout -q "$commit"
           cp "$shell_zip" "$src/NapCat.Shell.zip"
 
-          # base/Dockerfile 作为第一阶段（官方镜像改走 ECR Public 镜像源，避开 Docker Hub 限流），
+          # base/Dockerfile 作为第一阶段（官方镜像改走 ECR Public 镜像源），
           # 原 Dockerfile 的 FROM mlikiowa/napcat-docker:base 改为引用该阶段
           {
             awk '/^FROM[ \t]/ && !done {
@@ -512,122 +616,173 @@ jobs:
             echo "info=$repo@$(git -C "$src" rev-parse --short HEAD)，LinuxQQ ${qq:-?}"
           } | tee -a "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
-        if: steps.dk.outcome == 'success'
-
       - uses: docker/setup-buildx-action@v3
-        if: steps.dk.outcome == 'success'
 
-      # 底座只有很少几种，先单独构建并写入缓存，后面各版本直接复用（arm64 在模拟环境里装依赖很慢）
-      - name: Cache base image (amd64)
-        if: steps.dk.outcome == 'success'
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # 底座只有两种，先单独构建并写入缓存，后面各版本直接复用
+      - name: Cache base image
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: ${{ steps.dk.outputs.context }}
           file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
           target: napcat-base
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           outputs: type=cacheonly
-          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-amd64
-          cache-to: type=gha,mode=max,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-amd64
+          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-${{ matrix.arch }}
 
-      - name: Cache base image (arm64)
-        if: steps.dk.outcome == 'success'
+      - name: Build & push to GHCR (by digest)
+        id: push
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: ${{ steps.dk.outputs.context }}
           file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
-          target: napcat-base
-          platforms: linux/arm64
-          outputs: type=cacheonly
-          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-arm64
-          cache-to: type=gha,mode=max,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-arm64
-
-      - name: Build Docker image (amd64)
-        id: dk_amd64
-        if: steps.dk.outcome == 'success'
-        continue-on-error: true
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ steps.dk.outputs.context }}
-          file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
-          platforms: linux/amd64
-          tags: ${{ env.DOCKER_IMAGE }}:${{ matrix.tag }}
-          outputs: type=docker,dest=dist/napcat-docker-${{ matrix.tag }}-amd64.tar
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ matrix.tag }}
+          outputs: type=image,name=${{ needs.prepare.outputs.ghcr_image }},push-by-digest=true,name-canonical=true,push=true
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-amd64
+          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-${{ matrix.arch }}
 
-      - name: Build Docker image (arm64)
-        id: dk_arm64
-        if: steps.dk.outcome == 'success'
+      # 同一份构建结果再导出成 tar（直接复用上一步的构建缓存，很快）
+      - name: Export docker-load tar
+        id: tar
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: ${{ steps.dk.outputs.context }}
           file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
-          platforms: linux/arm64
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ matrix.tag }}
           tags: ${{ env.DOCKER_IMAGE }}:${{ matrix.tag }}
-          outputs: type=docker,dest=dist/napcat-docker-${{ matrix.tag }}-arm64.tar
+          outputs: type=docker,dest=${{ runner.temp }}/napcat-docker-${{ matrix.tag }}-${{ matrix.arch }}.tar
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-arm64
+          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-${{ matrix.arch }}
 
-      - name: Record Docker results
-        if: always()
+      - name: Save digest
+        if: steps.push.outcome == 'success'
         env:
-          DK_OUTCOME: ${{ steps.dk.outcome }}
-          DK_INFO: ${{ steps.dk.outputs.info }}
-          AMD64: ${{ steps.dk_amd64.outcome }}
-          ARM64: ${{ steps.dk_arm64.outcome }}
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
-          if [ "$DK_OUTCOME" != success ]; then
-            printf '%s\t%s\n' "napcat-docker" "构建失败（准备阶段）" >> "$REPORT"; exit 0
-          fi
-          for arch in amd64 arm64; do
-            f="napcat-docker-$TAG-$arch.tar"
-            outcome=$AMD64; [ "$arch" = arm64 ] && outcome=$ARM64
-            if [ "$outcome" = success ] && [ -s "dist/$f" ]; then
-              (cd dist && sha256sum "$f" > "$f.sha256")
-              printf '%s\t%s\n' "$f" "重新构建（$DK_INFO）" >> "$REPORT"
-            else
-              rm -f "dist/$f"
-              printf '%s\t%s\n' "$f" "构建失败" >> "$REPORT"
-            fi
-          done
+          mkdir -p "$RUNNER_TEMP/digests"
+          echo "$DIGEST" > "$RUNNER_TEMP/digests/$TAG-$ARCH"
 
-      - name: Upload to release
+      - name: Upload digest
+        if: steps.push.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: digest-${{ matrix.tag }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          overwrite: true
+          retention-days: 7
+
+      - name: Upload tar to release
+        id: up
+        if: steps.tar.outcome == 'success'
         run: |
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "NapCat $TAG" \
-              --notes-file "$RUNNER_TEMP/notes/$TAG.md" --latest=false
-          fi
-          shopt -s nullglob
-          files=(dist/*)
-          if [ ${#files[@]} -eq 0 ]; then echo "::warning::没有可上传的文件"; exit 0; fi
-          ls -la dist
-          for f in "${files[@]}"; do
-            for _ in 1 2 3; do gh release upload "$TAG" "$f" --clobber && break; sleep 20; done
+          f="napcat-docker-$TAG-$ARCH.tar"
+          cd "$RUNNER_TEMP"
+          [ -s "$f" ] || { echo "::error::$f 是空的"; exit 1; }
+          sha256sum "$f" > "$f.sha256"
+          for x in "$f" "$f.sha256"; do
+            ok=
+            for _ in 1 2 3; do if gh release upload "$TAG" "$x" --clobber; then ok=1; break; fi; sleep 20; done
+            [ -n "$ok" ] || { echo "::error::上传 $x 失败"; exit 1; }
           done
-          # 本版本镜像已上传，删掉以前用旧版本顶替的 -fallback- 文件
-          if [ -f "dist/napcat-docker-$TAG-amd64.tar" ] && [ -f "dist/napcat-docker-$TAG-arm64.tar" ]; then
-            gh release view "$TAG" --json assets -q '.assets[].name' | grep -E "^napcat-docker-$TAG-fallback-" \
-              | while read -r old; do echo "删除旧的替代镜像 $old"; gh release delete-asset "$TAG" "$old" -y; done || true
-          fi
+          # 删掉以前用旧版本顶替的同架构 -fallback- 文件
+          gh release view "$TAG" --json assets -q '.assets[].name' \
+            | grep -E "^napcat-docker-$TAG-fallback-.*-$ARCH\.tar(\.sha256)?$" \
+            | while read -r old; do echo "删除旧的替代镜像 $old"; gh release delete-asset "$TAG" "$old" -y; done || true
 
       - name: Summary
         if: always()
+        env:
+          INFO: ${{ steps.dk.outputs.info }}
+          DK: ${{ steps.dk.outcome }}
+          PUSH: ${{ steps.push.outcome }}
+          TAR: ${{ steps.tar.outcome }}
+          UP: ${{ steps.up.outcome }}
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
+          mark() { [ "$1" = success ] && echo "✅" || echo "❌"; }
           {
-            echo "### $TAG"
+            echo "### $TAG / $ARCH"
             echo
-            echo "| 文件 | 来源 |"
-            echo "| --- | --- |"
-            [ -f "$REPORT" ] && awk -F'\t' '{printf "| %s | %s |\n", $1, $2}' "$REPORT"
+            echo "- 配方：${INFO:-（准备阶段失败）}"
+            echo "- Release tar：$(mark "$UP") napcat-docker-$TAG-$ARCH.tar"
+            echo "- GHCR：$(mark "$PUSH") ${DIGEST:-}"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ -f "$REPORT" ] && grep -qE '缺失|失败' "$REPORT"; then
-            echo "::error::$TAG 有产物没拿到，见汇总；可直接 Re-run failed jobs"
+          if [ "$DK" != success ] || [ "$PUSH" != success ] || [ "$TAR" != success ] || [ "$UP" != success ]; then
+            echo "::error::$TAG / $ARCH 没有全部完成，可直接 Re-run failed jobs"
             exit 1
           fi
+
+  # ---------------------------------------------------------------------------
+  # GHCR：把每个版本的 amd64 / arm64 合并成一个多架构标签，最新版另打 latest
+  # ---------------------------------------------------------------------------
+  ghcr:
+    needs: [prepare, docker]
+    if: ${{ !cancelled() && inputs.mode == 'full' && needs.prepare.outputs.docker_count != '0' }}
+    runs-on: ubuntu-latest
+    env:
+      GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+      LATEST: ${{ needs.prepare.outputs.latest }}
+      DOCKER_TAGS: ${{ needs.prepare.outputs.docker_matrix }}
+    steps:
+      - name: Download digests
+        continue-on-error: true   # 一个都没成功时没有可下载的
+        uses: actions/download-artifact@v7
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create multi-arch tags
+        run: |
+          d="$RUNNER_TEMP/digests"
+          {
+            echo "### GHCR：$GHCR_IMAGE"
+            echo
+            echo "| 版本 | 结果 |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for t in $(jq -r '.[]' <<<"$DOCKER_TAGS"); do
+            refs=()
+            for arch in amd64 arm64; do
+              if [ -s "$d/$t-$arch" ]; then refs+=("$GHCR_IMAGE@$(cat "$d/$t-$arch")"); fi
+            done
+            if [ ${#refs[@]} -ne 2 ]; then
+              echo "| $t | ❌ 缺某个架构（重跑失败的 docker 任务后会自动补上） |" >> "$GITHUB_STEP_SUMMARY"
+              failed=1; continue
+            fi
+            names=("$GHCR_IMAGE:$t")
+            if [ "$t" = "$LATEST" ]; then names+=("$GHCR_IMAGE:latest"); fi
+            tags=(); for n in "${names[@]}"; do tags+=(-t "$n"); done
+            if docker buildx imagetools create "${tags[@]}" "${refs[@]}"; then
+              echo "| $t | ✅ ${names[*]} |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $t | ❌ 合并失败 |" >> "$GITHUB_STEP_SUMMARY"; failed=1
+            fi
+          done
+          if [ "$failed" = 1 ]; then exit 1; fi
