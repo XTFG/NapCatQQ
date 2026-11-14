@@ -141,6 +141,22 @@ def find_note_container (html: str, tag: str):
     return best
 
 
+def find_raw_markdown (html: str, tag: str) -> str | None:
+    """
+    有些页面 newreleases 没渲染说明，而是把 Markdown 原文放进 <pre><code> 原样显示。
+    这种情况直接取原文（比从 HTML 转回来更准）。
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    version = tag.lstrip('vV')
+    for code in soup.select('pre > code'):
+        text = code.get_text()
+        if version in text and '/compare/' in text:
+            return text
+    return None
+
+
 def from_newreleases (tag: str) -> str | None:
     key = os.environ.get('NEWRELEASES_API_KEY', '').strip()
     if key:
@@ -163,6 +179,9 @@ def from_newreleases (tag: str) -> str | None:
         container = find_note_container(page, tag)
         if container is not None:
             return html_to_markdown(str(container))
+        raw = find_raw_markdown(page, tag)
+        if raw is not None:
+            return raw
         # 偶尔拿到的是限流 / 验证页，不是正常页面 → 等一会儿重试
         debug_dir = os.environ.get('NOTES_DEBUG_DIR')
         if debug_dir:
