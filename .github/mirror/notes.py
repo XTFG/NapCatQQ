@@ -10,11 +10,14 @@
   3. newreleases  newreleases.io 的存档（v4.18.37 及以前是发布时 AI 生成的，只能从存档找回）
                 有 NEWRELEASES_API_KEY 走 API，否则抓页面
   4. wayback    Wayback Machine 存档的 GitHub Release 页面
-  5. fallback   都没有：按提交记录生成，并在开头写明“原始说明未能找回”
+  5. 都没有：按提交记录生成，并在开头写明“原始说明未能找回”。来源记为
+       unreleased  newreleases 明确 404 且 Wayback 无存档 → 上游没正式发布过（工作流不建 Release）
+       fallback    有来源出错 / 被拦截，没法下结论 → 照常发布
 
 用法:
   notes.py --tag v4.17.23 --repo-dir . --out notes/v4.17.23.md [--link-repo NapNeko/NapCatQQ]
-标准输出打印命中的来源名，供工作流写进汇总表。
+标准输出打印命中的来源名（override / generator / newreleases / wayback / unreleased / fallback），
+供工作流写进汇总表并据此决定是否建 Release。
 """
 from __future__ import annotations
 
@@ -39,7 +42,12 @@ def log (*args) -> None:
     print(*args, file=sys.stderr)
 
 
+class FetchError (Exception):
+    """没查成（网络错误、被拦截、页面看不懂），不能据此判断“不存在”。"""
+
+
 def http_get (url: str, headers: dict | None = None, timeout: int = 40, tries: int = 3) -> str | None:
+    """成功返回正文；明确不存在（404/410）返回 None；其他失败抛 FetchError。"""
     last: Exception | None = None
     for attempt in range(tries):
         try:
@@ -47,9 +55,11 @@ def http_get (url: str, headers: dict | None = None, timeout: int = 40, tries: i
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read().decode('utf-8', 'replace')
         except urllib.error.HTTPError as err:
-            if err.code in (401, 403, 404, 410):
+            if err.code in (404, 410):
                 log(f'  GET {url} -> HTTP {err.code}')
                 return None
+            if err.code in (401, 403):
+                raise FetchError(f'GET {url} -> HTTP {err.code}') from err
             last = err
             if err.code == 429:
                 wait = err.headers.get('Retry-After') or '30'
@@ -58,8 +68,7 @@ def http_get (url: str, headers: dict | None = None, timeout: int = 40, tries: i
         except Exception as err:  # noqa: BLE001 - 网络错误一律重试
             last = err
         time.sleep(3 * (attempt + 1))
-    log(f'  GET {url} failed: {last}')
-    return None
+    raise FetchError(f'GET {url} failed: {last}')
 
 
 def git (repo_dir: str, *args: str) -> str:
@@ -150,7 +159,9 @@ def from_newreleases (tag: str) -> str | None:
     if not page:
         return None
     container = find_note_container(page, tag)
-    return html_to_markdown(str(container)) if container is not None else None
+    if container is None:
+        raise FetchError('newreleases 页面里没找到说明正文（页面结构可能变了）')
+    return html_to_markdown(str(container))
 
 
 def from_wayback (tag: str) -> str | None:
@@ -158,21 +169,23 @@ def from_wayback (tag: str) -> str | None:
 
     target = f'github.com/{UPSTREAM}/releases/tag/{tag}'
     info = http_get('https://archive.org/wayback/available?url=' + urllib.parse.quote(target, safe=''))
-    if not info:
-        return None
+    if info is None:
+        raise FetchError('Wayback 可用性接口返回 404')
     try:
         snap = json.loads(info).get('archived_snapshots', {}).get('closest') or {}
-    except json.JSONDecodeError:
-        return None
-    if not snap.get('available') or not snap.get('timestamp'):
-        return None
+    except json.JSONDecodeError as err:
+        raise FetchError('Wayback 可用性接口返回的不是 JSON') from err
+    if not snap.get('available') or not snap.get('timestamp') or str(snap.get('status', '200')) != '200':
+        return None  # 没有存档（或存的是 404 页）
     # id_ = 原始页面，不改写链接
     page = http_get(f'https://web.archive.org/web/{snap["timestamp"]}id_/https://{target}')
-    if not page:
+    if page is None:
         return None
     soup = BeautifulSoup(page, 'html.parser')
     body = soup.select_one('[data-test-selector="body-content"]') or soup.select_one('.markdown-body')
-    return html_to_markdown(str(body)) if body is not None else None
+    if body is None:
+        raise FetchError('Wayback 存档页里没找到说明正文')
+    return html_to_markdown(str(body))
 
 
 def from_commits (tag: str, repo_dir: str, generator_path: str) -> str:
@@ -194,12 +207,22 @@ def rewrite_links (text: str, link_repo: str) -> str:
                   rf'https://github.com/{link_repo}/\1/', text, flags=re.IGNORECASE)
 
 
+def rewrite_docs (text: str, docs_url: str) -> str:
+    """把上游文档站 napneko.github.io 的链接换成自己的文档站（路径保持不变）。"""
+    if not docs_url:
+        return text
+    docs_url = docs_url.rstrip('/') + '/'
+    text = re.sub(r'https?://napneko\.github\.io/', docs_url, text, flags=re.IGNORECASE)
+    return re.sub(r'https?://napneko\.github\.io(?![\w.-])', docs_url, text, flags=re.IGNORECASE)
+
+
 def main () -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--tag', required=True)
     parser.add_argument('--repo-dir', default='.')
     parser.add_argument('--out', required=True)
     parser.add_argument('--link-repo', default=UPSTREAM)
+    parser.add_argument('--docs-url', default='', help='把 napneko.github.io 文档链接换成这个地址；留空不换')
     parser.add_argument('--override-dir', default='release-notes')
     parser.add_argument('--generator', default='.github/scripts/generate-release-notes.mjs',
                         help='兜底时用来按提交记录生成说明的脚本')
@@ -215,20 +238,23 @@ def main () -> int:
         steps += [('newreleases', lambda: from_newreleases(tag)), ('wayback', lambda: from_wayback(tag))]
 
     text, source = None, None
+    uncertain = args.skip_network  # 没查网络就不能断定“没发布过”
     for name, fetch in steps:
         try:
             text = fetch()
         except Exception as err:  # noqa: BLE001 - 某个来源出错就换下一个
             log(f'  [{tag}] {name} error: {err}')
             text = None
+            uncertain = True
         if text and text.strip():
             source = name
             break
     if not source:
         text = from_commits(tag, args.repo_dir, os.path.join(args.repo_dir, args.generator))
-        source = 'fallback'
+        # 两个存档都明确说“没有” → 上游没正式发布过；有任何一处没查成 → 照常按 fallback 发布
+        source = 'fallback' if uncertain else 'unreleased'
 
-    text = rewrite_links(text, args.link_repo).rstrip() + '\n'
+    text = rewrite_docs(rewrite_links(text, args.link_repo), args.docs_url).rstrip() + '\n'
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as fh:
         fh.write(text)
