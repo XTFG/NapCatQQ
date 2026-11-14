@@ -161,6 +161,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           LINK_REPO: ${{ inputs.link_repo || github.repository }}
           NEWRELEASES_API_KEY: ${{ secrets.NEWRELEASES_API_KEY }}
+          NOTES_DEBUG_DIR: notes/debug   # 提取失败时保存原页面，随说明包一起上传
         run: |
           mkdir -p notes
           : > notes/sources.tsv
