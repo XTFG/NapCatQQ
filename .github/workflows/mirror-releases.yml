@@ -76,6 +76,16 @@ env:
   # v4.18.30 起内置 QQ 升级到 9.9.33（之前的旧版因腾讯下架旧 QQ 已装不上）。
   # 格式 起始版本=取自哪个版本的 Release，从新到旧排列；在本仓库和 ASSET_MIRRORS 里找该版本的 OneKey
   ONEKEY_MAP: v4.18.30=v4.18.42 v0.0.0=v4.18.19
+  # 旧版 QQ 安装包已从腾讯 CDN 下架。原地址不通时按下表找镜像，并核对是同一个文件：
+  #   Windows：原地址目录名就是文件 MD5 的前 8 位（有 SHA256 的用 SHA256）
+  #   Linux  ：deb 里的版本号（含构建号）必须和原文件名一致
+  # 格式：原文件名（Linux 写版本号）  镜像地址…（Linux 地址里的 ${arch} 会换成 amd64 / arm64）
+  QQ_WIN_MIRRORS: |
+    QQ9.9.32.50969_x64.exe https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260720-ffedf7c6/QQ_9.9.32_260716_x64_01.exe
+  QQ_LINUX_MIRRORS: |
+    3.2.21-42086 https://github.com/zydou/QQ-Linux/releases/download/3.2.21-251114/QQ-3.2.21-251114-${arch}.deb
+    3.2.25-45758 https://github.com/zydou/QQ-Linux/releases/download/3.2.25-260205/QQ-3.2.25-260205-${arch}.deb
+    3.2.28-48517 https://github.com/zydou/QQ-Linux/releases/download/3.2.28-260429/QQ-3.2.28-260429-${arch}.deb
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -152,15 +162,14 @@ jobs:
           echo "ghcr_image=$ghcr_image" >> "$GITHUB_OUTPUT"
 
           # 现有 Release 及其文件，zip 和 Docker 分开判断是否齐全，重新运行时只补缺的部分：
-          #   zip 齐全    = 4 个 zip 都在
+          #   zip 齐全    = Shell / Framework / OneKey 都在（Windows.Node 依赖的 QQ 安装包很多已下架，不强求）
           #   Docker 齐全 = 本版本的 amd64/arm64 tar 都在（-fallback- 的替代镜像不算）且 GHCR 上已有该标签
           gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
             -q '.[] | [.tag_name, ([.assets[].name] | join(" "))] | @tsv' > releases.tsv
           cut -f1 releases.tsv | sort > existing.txt
           awk -F'\t' '{
             n = split($2, a, " "); delete h; for (i = 1; i <= n; i++) h[a[i]] = 1
-            if (("NapCat.Shell.zip" in h) && ("NapCat.Framework.zip" in h) && ("NapCat.Shell.Windows.Node.zip" in h) \
-                && ("NapCat.Shell.Windows.OneKey.zip" in h)) print $1
+            if (("NapCat.Shell.zip" in h) && ("NapCat.Framework.zip" in h) && ("NapCat.Shell.Windows.OneKey.zip" in h)) print $1
           }' releases.tsv | sort > zips_complete.txt
           awk -F'\t' '{
             n = split($2, a, " "); delete h; for (i = 1; i <= n; i++) h[a[i]] = 1
@@ -446,9 +455,28 @@ jobs:
           command -v 7z >/dev/null || { sudo apt-get update -qq; sudo apt-get install -y -qq p7zip-full; }
           dl="$RUNNER_TEMP/dl"; qq="$RUNNER_TEMP/qq"; nd="$RUNNER_TEMP/node-win"
           mkdir -p "$dl" "$qq" "$nd"
-          curl -fL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 --max-time 1200 \
-            -A 'Mozilla/5.0' -o "$dl/qq.exe" "$QQ_URL"
-          if [ -n "$QQ_SHA256" ]; then echo "$QQ_SHA256  $dl/qq.exe" | sha256sum --check --strict -; fi
+
+          # QQ 安装包：先试原地址，已下架就按 QQ_WIN_MIRRORS 找镜像，核对是同一个文件
+          name=$(basename "$QQ_URL")
+          want_md5=$(sed -nE 's#.*/([0-9a-f]{8})/[^/]+$#\1#p' <<<"$QQ_URL")   # 原地址目录名 = MD5 前 8 位
+          got=
+          for u in "$QQ_URL" $(awk -v n="$name" '$1 == n { for (i = 2; i <= NF; i++) print $i }' <<<"$QQ_WIN_MIRRORS"); do
+            rm -f "$dl/qq.exe"
+            curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 1200 -A 'Mozilla/5.0' -o "$dl/qq.exe" "$u" || continue
+            if [ -n "$QQ_SHA256" ]; then
+              if ! echo "$QQ_SHA256  $dl/qq.exe" | sha256sum --check --strict -; then echo "::warning::$u 的 SHA256 对不上，不用"; continue; fi
+            elif [ -n "$want_md5" ]; then
+              md5=$(md5sum "$dl/qq.exe" | cut -c1-8)
+              if [ "$md5" != "$want_md5" ]; then echo "::warning::$u 的 MD5 是 $md5…，原文件是 $want_md5…，不是同一个，不用"; continue; fi
+            fi
+            got=$u; break
+          done
+          if [ -z "$got" ]; then
+            echo "::warning::QQ 安装包 $name 已下架，镜像里也没有同一个文件，无法重建 Windows.Node"
+            echo "$name" > "$RUNNER_TEMP/qq_unavailable"
+            exit 0
+          fi
+          [ "$got" = "$QQ_URL" ] || echo "$got" > "$RUNNER_TEMP/qq_mirror"
           curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o "$dl/node.zip" \
             "https://nodejs.org/dist/v$NODE_WIN/node-v$NODE_WIN-win-x64.zip"
           7z x -y -o"$qq" "$dl/qq.exe" >/dev/null
@@ -483,7 +511,11 @@ jobs:
           for n in NapCat.Shell NapCat.Framework NapCat.Shell.Windows.Node; do
             if [ -d "out/$n" ]; then
               (cd "out/$n" && zip -qr "$GITHUB_WORKSPACE/dist/$n.zip" .)
-              printf '%s\t%s\n' "$n.zip" "重新构建" >> "$REPORT"
+              note="重新构建"
+              if [ "$n" = NapCat.Shell.Windows.Node ] && [ -f "$RUNNER_TEMP/qq_mirror" ]; then
+                note="重新构建（QQ 安装包原地址已下架，用镜像 $(cat "$RUNNER_TEMP/qq_mirror")，已核对是同一个文件）"
+              fi
+              printf '%s\t%s\n' "$n.zip" "$note" >> "$REPORT"
             fi
           done
           rm -rf out node_modules packages/*/node_modules
@@ -513,6 +545,11 @@ jobs:
                 done
               fi
               if [ -n "$got" ]; then printf '%s\t%s\n' "$n" "原包（取自 $got，同一份资源文件）" >> "$REPORT"; continue; fi
+            fi
+            if [ "$n" = NapCat.Shell.Windows.Node.zip ] && [ -f "$RUNNER_TEMP/qq_unavailable" ]; then
+              # 已知无法补齐的情况，不算失败（否则每次重跑都白跑）
+              printf '%s\t%s\n' "$n" "跳过：依赖的 QQ 安装包 $(cat "$RUNNER_TEMP/qq_unavailable") 已下架，没有镜像，也没有原包" >> "$REPORT"
+              continue
             fi
             printf '%s\t%s\n' "$n" "缺失" >> "$REPORT"
           done
@@ -609,11 +646,47 @@ jobs:
           } > "$src/Dockerfile.archive"
           grep -q '^FROM napcat-base$' "$src/Dockerfile.archive" || { echo "::error::Dockerfile 结构不认识"; exit 1; }
 
+          # LinuxQQ：原地址已下架时换成 QQ_LINUX_MIRRORS 里的镜像，并核对 deb 的版本号（含构建号）一致。
+          # 核对过的 deb 在构建时临时挂载进去（RUN --mount），不新增镜像层，镜像大小与原来一样。
+          mirrored=
+          while read -r url; do
+            [ -n "$url" ] || continue
+            ver=$(sed -E 's#.*linuxqq_([0-9.]+-[0-9]+)_.*#\1#' <<<"$url")
+            real=$(sed -E "s#\\\$\\{?arch\\}?#$ARCH#" <<<"$url")
+            if curl -fsSL -r 0-0 -o /dev/null --connect-timeout 20 --max-time 60 "$real"; then
+              echo "LinuxQQ $ver 原地址可用"; continue
+            fi
+            mirror=$(awk -v v="$ver" '$1 == v { print $2 }' <<<"$QQ_LINUX_MIRRORS")
+            if [ -z "$mirror" ]; then
+              echo "::error::LinuxQQ $ver 已从腾讯 CDN 下架，也没有可用的镜像，无法构建（可在 QQ_LINUX_MIRRORS 里补一个）"; exit 1
+            fi
+            mreal=$(sed -E "s#\\\$\\{?arch\\}?#$ARCH#" <<<"$mirror")
+            curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 900 -o "$src/linuxqq.mirror.deb" "$mreal"
+            got=$(dpkg-deb -f "$src/linuxqq.mirror.deb" Version)
+            if [ "$got" != "$ver" ]; then
+              echo "::error::镜像里的 LinuxQQ 版本是 $got，原来是 $ver，不是同一个包，不用"; exit 1
+            fi
+            python3 - "$src/Dockerfile.archive" "$url" <<'PY'
+          import re, sys
+          path, url = sys.argv[1], sys.argv[2]
+          lines = open(path, encoding='utf-8').read().split('\n')
+          i = next(n for n, l in enumerate(lines) if url in l)
+          while not re.match(r'\s*RUN\b', lines[i], re.I):
+              i -= 1
+          mount = '--mount=type=bind,source=linuxqq.mirror.deb,target=/tmp/linuxqq.mirror.deb'
+          if mount not in lines[i]:
+              lines[i] = re.sub(r'^(\s*RUN)\b', r'\1 ' + mount, lines[i], count=1, flags=re.I)
+          open(path, 'w', encoding='utf-8').write('\n'.join(lines).replace(url, 'file:///tmp/linuxqq.mirror.deb'))
+          PY
+            echo "LinuxQQ $ver 原地址已下架，改用镜像 $mirror（deb 版本号已核对一致）"
+            mirrored="（原地址已下架，用 ${mirror%%/releases/*} 的镜像，版本号已核对）"
+          done < <(grep -oE 'https?://[^ "'"'"']*linuxqq_[0-9.]+-[0-9]+_\$\{?arch\}?\.deb' "$src/Dockerfile.archive" | sort -u)
+
           qq=$(grep -oE '(linuxqq|QQ)_[0-9.]+[-_][0-9]+' "$src/Dockerfile" | head -n1 || true)
           {
             echo "context=$src"
             echo "base_hash=$(git -C "$src" rev-parse --short "HEAD:base/Dockerfile")"
-            echo "info=$repo@$(git -C "$src" rev-parse --short HEAD)，LinuxQQ ${qq:-?}"
+            echo "info=$repo@$(git -C "$src" rev-parse --short HEAD)，LinuxQQ ${qq:-?}$mirrored"
           } | tee -a "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
