@@ -155,13 +155,24 @@ def from_newreleases (tag: str) -> str | None:
                 message = ''
             if message.strip():
                 return html_to_markdown(message)
-    page = http_get(f'https://newreleases.io/project/github/{UPSTREAM}/release/{urllib.parse.quote(tag)}')
-    if not page:
-        return None
-    container = find_note_container(page, tag)
-    if container is None:
-        raise FetchError('newreleases 页面里没找到说明正文（页面结构可能变了）')
-    return html_to_markdown(str(container))
+    url = f'https://newreleases.io/project/github/{UPSTREAM}/release/{urllib.parse.quote(tag)}'
+    for attempt in range(3):
+        page = http_get(url)
+        if page is None:
+            return None
+        container = find_note_container(page, tag)
+        if container is not None:
+            return html_to_markdown(str(container))
+        # 偶尔拿到的是限流 / 验证页，不是正常页面 → 等一会儿重试
+        debug_dir = os.environ.get('NOTES_DEBUG_DIR')
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, f'{tag}.newreleases.{attempt + 1}.html'), 'w', encoding='utf-8') as fh:
+                fh.write(page)
+        if attempt < 2:
+            log(f'  [{tag}] newreleases 页面里没找到说明正文，{15 * (attempt + 1)} 秒后重试')
+            time.sleep(15 * (attempt + 1))
+    raise FetchError('newreleases 页面里没找到说明正文（重试 3 次仍失败，页面已存到 debug 目录）')
 
 
 def from_wayback (tag: str) -> str | None:
