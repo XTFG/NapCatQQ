@@ -11,8 +11,10 @@
 #           （Node / pnpm 版本、QQ 安装包地址与校验值、拷贝的 QQ 文件列表）
 #   拉原包    NapCat.Shell.Windows.OneKey.zip（资源仓库已删，无法构建），以及构建失败的产物
 #           → 依次从 ASSET_MIRRORS 里同名 tag 的 Release 下载
-#   Docker   构建仓库已删，无法构建 → 从 Docker Hub 拉原镜像（amd64 / arm64），
-#           导出为 `docker load -i xxx.tar` 可直接导入的 tar，并附 .sha256
+#   Docker   Docker Hub 上的原镜像已删 → 重新构建（amd64 / arm64）：
+#           用 NapCat-Docker 的 fork（完整保留了历史），取该版本发布时的那一版
+#           Dockerfile / base / entrypoint（含当时锁定的 LinuxQQ），放入本次的 NapCat.Shell.zip，
+#           导出为 `docker load -i xxx.tar` 可直接导入的 tar（镜像名仍是 mlikiowa/napcat-docker:<tag>），附 .sha256
 #
 # 建议用法：
 #   1. mode=dry-run   先只生成说明，在运行汇总 / artifact 里检查
@@ -20,8 +22,7 @@
 #   3. mode=full      补齐缺的 Release（可重复运行，已有的默认跳过）
 #
 # 可选 secrets：
-#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  登录 Docker Hub，避免匿名拉取限流（强烈建议）
-#   NEWRELEASES_API_KEY                   newreleases.io API key，找回说明更稳（没有就抓页面）
+#   NEWRELEASES_API_KEY   newreleases.io API key，找回说明更稳（没有就抓页面）
 # =============================================================================
 
 name: Mirror Releases
@@ -47,10 +48,6 @@ on:
       link_repo:
         description: '说明里提交/对比链接指向的仓库。留空 = 本仓库（链接可点）；填 NapNeko/NapCatQQ = 与原文逐字一致（链接已失效）'
         default: ''
-      docker_fallback:
-        description: 'Docker Hub 没有该版本镜像时，改用最近的旧版本（文件名带 -fallback-）'
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -61,9 +58,16 @@ concurrency:
 
 env:
   UPSTREAM: NapNeko/NapCatQQ
+  # 镜像名保持原样，docker load 后与原来的 compose 配置通用
   DOCKER_IMAGE: mlikiowa/napcat-docker
+  # 保留了 NapNeko/NapCat-Docker 完整历史的 fork，依次尝试
+  DOCKER_SRC_REPOS: XTFG/NapCat-Docker BB0813/NapCat-Docker synodriver/NapCat-Docker
   # 拉原包时依次尝试的仓库：在这些仓库里找同名 tag 的 Release 资产
-  ASSET_MIRRORS: 5wthf/NapCatQQ xuyuan985-star/NapCatQQ wlz-remake/NapCatQQ
+  ASSET_MIRRORS: XingYunStar/NapCatQQ 5wthf/NapCatQQ xuyuan985-star/NapCatQQ wlz-remake/NapCatQQ
+  # OneKey 原本每次发布时取自 NapCatResource（已删、无 fork），整个期间只换过一次：
+  # v4.18.30 起内置 QQ 升级到 9.9.33（之前的旧版因腾讯下架旧 QQ 已装不上）。
+  # 格式 起始版本=取自哪个版本的 Release，从新到旧排列；在本仓库和 ASSET_MIRRORS 里找该版本的 OneKey
+  ONEKEY_MAP: v4.18.30=v4.18.42 v0.0.0=v4.18.19
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -124,17 +128,17 @@ jobs:
             done < selected.txt
           fi
 
-          # 现有 Release 及其文件。“齐全”= 4 个 zip + amd64/arm64 两个 Docker tar 都在；
+          # 现有 Release 及其文件。“齐全”= 4 个 zip + 本版本的 amd64/arm64 Docker tar 都在
+          # （-fallback- 的替代镜像不算，会重新构建）；
           # 限流 / 中断后重新运行时，只有齐全的才跳过，缺文件的会继续补
           gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
             -q '.[] | [.tag_name, ([.assets[].name] | join(" "))] | @tsv' > releases.tsv
           cut -f1 releases.tsv | sort > existing.txt
           awk -F'\t' '{
             n = split($2, a, " "); delete h; for (i = 1; i <= n; i++) h[a[i]] = 1
-            amd = 0; arm = 0
-            for (k in h) { if (k ~ /^napcat-docker-.*-amd64\.tar$/) amd = 1; if (k ~ /^napcat-docker-.*-arm64\.tar$/) arm = 1 }
             if (("NapCat.Shell.zip" in h) && ("NapCat.Framework.zip" in h) && ("NapCat.Shell.Windows.Node.zip" in h) \
-                && ("NapCat.Shell.Windows.OneKey.zip" in h) && amd && arm) print $1
+                && ("NapCat.Shell.Windows.OneKey.zip" in h) \
+                && (("napcat-docker-" $1 "-amd64.tar") in h) && (("napcat-docker-" $1 "-arm64.tar") in h)) print $1
           }' releases.tsv | sort > complete.txt
           sort selected.txt > selected.sorted
           case "$MODE" in
@@ -218,10 +222,10 @@ jobs:
     needs: prepare
     if: inputs.mode == 'full' && needs.prepare.outputs.count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 6
       matrix:
         tag: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
@@ -418,61 +422,152 @@ jobs:
             if [ -n "$got" ]; then printf '%s\t%s\n' "$n" "原包（$got）" >> "$REPORT"; continue; fi
 
             if [ "$n" = NapCat.Shell.Windows.OneKey.zip ]; then
-              # 原流程每次都从 NapCatResource 主分支取同一个文件，相邻版本通用 → 取本仓库最近版本里的
-              cands=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-                -q '.[] | select([.assets[].name] | index("NapCat.Shell.Windows.OneKey.zip")) | .tag_name' \
-                | grep -E '^v[0-9]' | sort -V || true)
-              near=$(printf '%s\n%s\n' "$cands" "$TAG" | sed '/^$/d' | sort -V | uniq | awk -v t="$TAG" '$0==t{print p; exit} {p=$0}' || true)
-              [ -n "$near" ] || near=$(printf '%s\n%s\n' "$cands" "$TAG" | sed '/^$/d' | sort -V | uniq | awk -v t="$TAG" 'f{print; exit} $0==t{f=1}' || true)
-              if [ -n "$near" ] && gh release download "$near" -p "$n" -D dist --clobber; then
-                printf '%s\t%s\n' "$n" "原包（取自本仓库 $near，同一资源文件）" >> "$REPORT"; continue
+              # 按 ONEKEY_MAP 找到这个版本当时用的那一份
+              use=""
+              for kv in $ONEKEY_MAP; do
+                from=${kv%%=*}
+                if [ "$(printf '%s\n%s\n' "$from" "$TAG" | sort -V | head -n1)" = "$from" ]; then use=${kv#*=}; break; fi
+              done
+              if [ -n "$use" ]; then
+                for r in "$GITHUB_REPOSITORY" $ASSET_MIRRORS; do
+                  if gh release download "$use" -R "$r" -p "$n" -D dist --clobber 2>/dev/null; then got="$r 的 $use"; break; fi
+                done
               fi
+              if [ -n "$got" ]; then printf '%s\t%s\n' "$n" "原包（取自 $got，同一份资源文件）" >> "$REPORT"; continue; fi
             fi
             printf '%s\t%s\n' "$n" "缺失" >> "$REPORT"
           done
 
-      - uses: imjasonh/setup-crane@v0.4
-
-      - name: Pull original Docker images
-        env:
-          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          FALLBACK: ${{ inputs.docker_fallback }}
+      # ---- Docker：用当时的 NapCat-Docker 配方重新构建 ----
+      - name: Prepare Docker build context
+        id: dk
+        continue-on-error: true
         run: |
-          if [ -n "$DH_USER" ] && [ -n "$DH_TOKEN" ]; then
-            crane auth login index.docker.io -u "$DH_USER" -p "$DH_TOKEN"
+          # 构建要用的 NapCat.Shell.zip：本次构建/拉取的，或 Release 里已有的
+          shell_zip=dist/NapCat.Shell.zip
+          if [ ! -f "$shell_zip" ]; then
+            shell_zip="$RUNNER_TEMP/NapCat.Shell.zip"
+            gh release download "$TAG" -p NapCat.Shell.zip -O "$shell_zip" --clobber
           fi
-          tags=""; listed=
-          for i in 1 2 3; do
-            if tags=$(crane ls "$DOCKER_IMAGE"); then listed=1; break; fi
-            sleep 20
+          unzip -tq "$shell_zip"
+
+          src="$RUNNER_TEMP/napcat-docker"
+          for r in $DOCKER_SRC_REPOS; do
+            rm -rf "$src"
+            if git clone -q --filter=blob:none "https://github.com/$r" "$src"; then repo=$r; break; fi
           done
-          if [ -z "$listed" ]; then
-            printf '%s\t%s\n' "napcat-docker" "Docker Hub 访问失败" >> "$REPORT"; exit 0
-          fi
-          use=""; label=""
-          if grep -qx "$TAG" <<<"$tags"; then
-            use=$TAG; label=$TAG
-          elif [ "$FALLBACK" = true ]; then
-            use=$( { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" || true; echo "$TAG"; } \
-              | sort -V | uniq | awk -v t="$TAG" '$0==t{print p; exit} {p=$0}' || true)
-            if [ -n "$use" ]; then label="$TAG-fallback-$use"; fi
-          fi
-          if [ -z "$use" ]; then
-            printf '%s\t%s\n' "napcat-docker" "Docker Hub 上没有该版本镜像" >> "$REPORT"; exit 0
+          [ -n "${repo:-}" ] || { echo "::error::NapCat-Docker 的 fork 都拉不到"; exit 1; }
+
+          # 发布时间 = 打 tag 的时间（没有就用提交时间）；取那之后 1 小时内 NapCat-Docker 的最新提交
+          ts=$(git for-each-ref --format='%(taggerdate:unix)' "refs/tags/$TAG")
+          [ -n "$ts" ] || ts=$(git log -1 --format=%ct "$TAG^{commit}")
+          commit=$(git -C "$src" rev-list -1 --before="@$((ts + 3600))" HEAD)
+          [ -n "$commit" ] || commit=$(git -C "$src" rev-list --max-parents=0 HEAD | tail -n1)
+          git -C "$src" checkout -q "$commit"
+          cp "$shell_zip" "$src/NapCat.Shell.zip"
+
+          # base/Dockerfile 作为第一阶段（官方镜像改走 ECR Public 镜像源，避开 Docker Hub 限流），
+          # 原 Dockerfile 的 FROM mlikiowa/napcat-docker:base 改为引用该阶段
+          {
+            awk '/^FROM[ \t]/ && !done {
+                   img = $2; if (img !~ /\//) img = "public.ecr.aws/docker/library/" img
+                   print "FROM " img " AS napcat-base"; done = 1; next
+                 } { print }' "$src/base/Dockerfile"
+            echo
+            sed -E 's#^FROM[[:space:]]+mlikiowa/napcat-docker:base([[:space:]].*)?$#FROM napcat-base#' "$src/Dockerfile"
+          } > "$src/Dockerfile.archive"
+          grep -q '^FROM napcat-base$' "$src/Dockerfile.archive" || { echo "::error::Dockerfile 结构不认识"; exit 1; }
+
+          qq=$(grep -oE '(linuxqq|QQ)_[0-9.]+[-_][0-9]+' "$src/Dockerfile" | head -n1 || true)
+          {
+            echo "context=$src"
+            echo "base_hash=$(git -C "$src" rev-parse --short "HEAD:base/Dockerfile")"
+            echo "info=$repo@$(git -C "$src" rev-parse --short HEAD)，LinuxQQ ${qq:-?}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.dk.outcome == 'success'
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.dk.outcome == 'success'
+
+      # 底座只有很少几种，先单独构建并写入缓存，后面各版本直接复用（arm64 在模拟环境里装依赖很慢）
+      - name: Cache base image (amd64)
+        if: steps.dk.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.dk.outputs.context }}
+          file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
+          target: napcat-base
+          platforms: linux/amd64
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-amd64
+          cache-to: type=gha,mode=max,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-amd64
+
+      - name: Cache base image (arm64)
+        if: steps.dk.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.dk.outputs.context }}
+          file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
+          target: napcat-base
+          platforms: linux/arm64
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-arm64
+          cache-to: type=gha,mode=max,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-arm64
+
+      - name: Build Docker image (amd64)
+        id: dk_amd64
+        if: steps.dk.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.dk.outputs.context }}
+          file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
+          platforms: linux/amd64
+          tags: ${{ env.DOCKER_IMAGE }}:${{ matrix.tag }}
+          outputs: type=docker,dest=dist/napcat-docker-${{ matrix.tag }}-amd64.tar
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-amd64
+
+      - name: Build Docker image (arm64)
+        id: dk_arm64
+        if: steps.dk.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.dk.outputs.context }}
+          file: ${{ steps.dk.outputs.context }}/Dockerfile.archive
+          platforms: linux/arm64
+          tags: ${{ env.DOCKER_IMAGE }}:${{ matrix.tag }}
+          outputs: type=docker,dest=dist/napcat-docker-${{ matrix.tag }}-arm64.tar
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-arm64
+
+      - name: Record Docker results
+        if: always()
+        env:
+          DK_OUTCOME: ${{ steps.dk.outcome }}
+          DK_INFO: ${{ steps.dk.outputs.info }}
+          AMD64: ${{ steps.dk_amd64.outcome }}
+          ARM64: ${{ steps.dk_arm64.outcome }}
+        run: |
+          if [ "$DK_OUTCOME" != success ]; then
+            printf '%s\t%s\n' "napcat-docker" "构建失败（准备阶段）" >> "$REPORT"; exit 0
           fi
           for arch in amd64 arm64; do
-            f="napcat-docker-$label-$arch.tar"
-            ok=
-            for i in 1 2 3; do
-              if crane pull --platform "linux/$arch" "$DOCKER_IMAGE:$use" "dist/$f"; then ok=1; break; fi
-              rm -f "dist/$f"; sleep $((30 * i))
-            done
-            if [ -n "$ok" ]; then
+            f="napcat-docker-$TAG-$arch.tar"
+            outcome=$AMD64; [ "$arch" = arm64 ] && outcome=$ARM64
+            if [ "$outcome" = success ] && [ -s "dist/$f" ]; then
               (cd dist && sha256sum "$f" > "$f.sha256")
-              printf '%s\t%s\n' "$f" "原镜像 $DOCKER_IMAGE:$use" >> "$REPORT"
+              printf '%s\t%s\n' "$f" "重新构建（$DK_INFO）" >> "$REPORT"
             else
-              printf '%s\t%s\n' "$f" "拉取失败" >> "$REPORT"
+              rm -f "dist/$f"
+              printf '%s\t%s\n' "$f" "构建失败" >> "$REPORT"
             fi
           done
 
@@ -489,6 +584,11 @@ jobs:
           for f in "${files[@]}"; do
             for _ in 1 2 3; do gh release upload "$TAG" "$f" --clobber && break; sleep 20; done
           done
+          # 本版本镜像已上传，删掉以前用旧版本顶替的 -fallback- 文件
+          if [ -f "dist/napcat-docker-$TAG-amd64.tar" ] && [ -f "dist/napcat-docker-$TAG-arm64.tar" ]; then
+            gh release view "$TAG" --json assets -q '.assets[].name' | grep -E "^napcat-docker-$TAG-fallback-" \
+              | while read -r old; do echo "删除旧的替代镜像 $old"; gh release delete-asset "$TAG" "$old" -y; done || true
+          fi
 
       - name: Summary
         if: always()
