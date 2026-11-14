@@ -658,7 +658,24 @@ jobs:
             fi
             mirror=$(awk -v v="$ver" '$1 == v { print $2 }' <<<"$QQ_LINUX_MIRRORS")
             if [ -z "$mirror" ]; then
-              echo "::error::LinuxQQ $ver 已从腾讯 CDN 下架，也没有可用的镜像，无法构建（可在 QQ_LINUX_MIRRORS 里补一个）"; exit 1
+              # 构建不了：改拉原包，即备份仓库里该版本、该架构的原版镜像 tar（有 .sha256 就先校验）
+              f="napcat-docker-$TAG-$ARCH.tar"
+              for m in $ASSET_MIRRORS; do
+                gh release download "$TAG" -R "$m" -p "$f" -D "$RUNNER_TEMP" --clobber 2>/dev/null || continue
+                if gh release download "$TAG" -R "$m" -p "$f.sha256" -D "$RUNNER_TEMP" --clobber 2>/dev/null; then
+                  if ! (cd "$RUNNER_TEMP" && sha256sum --check --strict "$f.sha256"); then
+                    echo "::warning::$m 的 $f 校验不通过，不用"; rm -f "$RUNNER_TEMP/$f"; continue
+                  fi
+                fi
+                echo "LinuxQQ $ver 已下架且没有镜像，改用 $m 保存的原版镜像 $f"
+                {
+                  echo "mode=original"
+                  echo "info=原包（$m 保存的原版镜像；LinuxQQ $ver 已下架，无法重新构建）"
+                } >> "$GITHUB_OUTPUT"
+                exit 0
+              done
+              echo "::error::LinuxQQ $ver 已从腾讯 CDN 下架，没有镜像，备份仓库里也没有原版镜像，无法构建（可在 QQ_LINUX_MIRRORS 里补一个）"
+              exit 1
             fi
             mreal=$(sed -E "s#\\\$\\{?arch\\}?#$ARCH#" <<<"$mirror")
             curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 900 -o "$src/linuxqq.mirror.deb" "$mreal"
@@ -684,6 +701,7 @@ jobs:
 
           qq=$(grep -oE '(linuxqq|QQ)_[0-9.]+[-_][0-9]+' "$src/Dockerfile" | head -n1 || true)
           {
+            echo "mode=build"
             echo "context=$src"
             echo "base_hash=$(git -C "$src" rev-parse --short "HEAD:base/Dockerfile")"
             echo "info=$repo@$(git -C "$src" rev-parse --short HEAD)，LinuxQQ ${qq:-?}$mirrored"
@@ -699,6 +717,7 @@ jobs:
 
       # 底座只有两种，先单独构建并写入缓存，后面各版本直接复用
       - name: Cache base image
+        if: steps.dk.outputs.mode == 'build'
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
@@ -712,6 +731,7 @@ jobs:
 
       - name: Build & push to GHCR (by digest)
         id: push
+        if: steps.dk.outputs.mode == 'build'
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
@@ -729,6 +749,7 @@ jobs:
       # 同一份构建结果再导出成 tar（直接复用上一步的构建缓存，很快）
       - name: Export docker-load tar
         id: tar
+        if: steps.dk.outputs.mode == 'build'
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
@@ -744,16 +765,35 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=napcat-base-${{ steps.dk.outputs.base_hash }}-${{ matrix.arch }}
 
+      # 构建不了、改用原包的版本：把原版镜像 tar 按 digest 推到 GHCR（不留临时标签）
+      - name: Push original image to GHCR (by digest)
+        id: pushorig
+        if: steps.dk.outputs.mode == 'original'
+        continue-on-error: true
+        run: |
+          case "$(uname -m)" in x86_64) a=x86_64 ;; aarch64|arm64) a=arm64 ;; *) a=$(uname -m) ;; esac
+          curl -fsSL --retry 3 \
+            "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_$a.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP" crane
+          f="$RUNNER_TEMP/napcat-docker-$TAG-$ARCH.tar"
+          # 确认原包里的镜像就是这个架构
+          cfg=$(tar -xOf "$f" manifest.json | jq -r '.[0].Config')
+          img_arch=$(tar -xOf "$f" "$cfg" | jq -r '.architecture')
+          if [ "$img_arch" != "$ARCH" ]; then echo "::error::原版镜像的架构是 $img_arch，不是 $ARCH"; exit 1; fi
+          digest=$("$RUNNER_TEMP/crane" digest --tarball "$f")
+          "$RUNNER_TEMP/crane" push "$f" "$GHCR_IMAGE@$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Save digest
-        if: steps.push.outcome == 'success'
+        if: steps.push.outcome == 'success' || steps.pushorig.outcome == 'success'
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.push.outputs.digest || steps.pushorig.outputs.digest }}
         run: |
           mkdir -p "$RUNNER_TEMP/digests"
           echo "$DIGEST" > "$RUNNER_TEMP/digests/$TAG-$ARCH"
 
       - name: Upload digest
-        if: steps.push.outcome == 'success'
+        if: steps.push.outcome == 'success' || steps.pushorig.outcome == 'success'
         uses: actions/upload-artifact@v6
         with:
           name: digest-${{ matrix.tag }}-${{ matrix.arch }}
@@ -763,7 +803,7 @@ jobs:
 
       - name: Upload tar to release
         id: up
-        if: steps.tar.outcome == 'success'
+        if: steps.tar.outcome == 'success' || (steps.dk.outcome == 'success' && steps.dk.outputs.mode == 'original')
         run: |
           f="napcat-docker-$TAG-$ARCH.tar"
           cd "$RUNNER_TEMP"
@@ -783,11 +823,12 @@ jobs:
         if: always()
         env:
           INFO: ${{ steps.dk.outputs.info }}
+          MODE: ${{ steps.dk.outputs.mode }}
           DK: ${{ steps.dk.outcome }}
-          PUSH: ${{ steps.push.outcome }}
-          TAR: ${{ steps.tar.outcome }}
+          PUSH: ${{ steps.dk.outputs.mode == 'original' && steps.pushorig.outcome || steps.push.outcome }}
+          TAR: ${{ steps.dk.outputs.mode == 'original' && 'success' || steps.tar.outcome }}
           UP: ${{ steps.up.outcome }}
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.push.outputs.digest || steps.pushorig.outputs.digest }}
         run: |
           mark() { [ "$1" = success ] && echo "✅" || echo "❌"; }
           {
