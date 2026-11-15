@@ -674,8 +674,13 @@ jobs:
                 } >> "$GITHUB_OUTPUT"
                 exit 0
               done
-              echo "::error::LinuxQQ $ver 已从腾讯 CDN 下架，没有镜像，备份仓库里也没有原版镜像，无法构建（可在 QQ_LINUX_MIRRORS 里补一个）"
-              exit 1
+              # 已知无法补齐的情况：标为跳过，不算失败（以后找到存档或原包，补进 QQ_LINUX_MIRRORS / ASSET_MIRRORS 再跑即可）
+              echo "::warning::LinuxQQ $ver 已从腾讯 CDN 下架，没有镜像，备份仓库里也没有原版镜像，跳过"
+              {
+                echo "mode=unavailable"
+                echo "info=跳过：LinuxQQ $ver 已下架，没有镜像，也没有原版镜像"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
             fi
             mreal=$(sed -E "s#\\\$\\{?arch\\}?#$ARCH#" <<<"$mirror")
             curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 900 -o "$src/linuxqq.mirror.deb" "$mreal"
@@ -830,6 +835,10 @@ jobs:
           UP: ${{ steps.up.outcome }}
           DIGEST: ${{ steps.push.outputs.digest || steps.pushorig.outputs.digest }}
         run: |
+          if [ "$MODE" = unavailable ]; then
+            { echo "### $TAG / $ARCH"; echo; echo "- ⏭️ $INFO"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           mark() { [ "$1" = success ] && echo "✅" || echo "❌"; }
           {
             echo "### $TAG / $ARCH"
@@ -886,8 +895,13 @@ jobs:
             for arch in amd64 arm64; do
               if [ -s "$d/$t-$arch" ]; then refs+=("$GHCR_IMAGE@$(cat "$d/$t-$arch")"); fi
             done
+            if [ ${#refs[@]} -eq 0 ]; then
+              # 两个架构都没有镜像：已知补不了的版本（docker 任务里标为跳过），或者两个都失败了（docker 任务会是红的）
+              echo "| $t | ⏭️ 两个架构都没有镜像，跳过（原因见对应的 docker 任务） |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
             if [ ${#refs[@]} -ne 2 ]; then
-              echo "| $t | ❌ 缺某个架构（重跑失败的 docker 任务后会自动补上） |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| $t | ❌ 只有一个架构（重跑失败的 docker 任务后会自动补上） |" >> "$GITHUB_STEP_SUMMARY"
               failed=1; continue
             fi
             names=("$GHCR_IMAGE:$t")
